@@ -1,15 +1,16 @@
 import tkinter #graphical user interface library
 def set_tile(row, column):
-    global curr_player
-    if board[row][column]["text"] == "": #only when its empty we can mark a tile
-        board[row][column]["text"] = curr_player #to mark the tile
-        if curr_player == playerX: #change player
+    global curr_player, last_player
+    if not game_over and board[row][column]["text"] == "":  # Check if the game is not over
+        board[row][column]["text"] = curr_player  # Mark the tile
+        last_player = curr_player  # Store the last player
+        if curr_player == playerX:  # Change player
             curr_player = playerO
         else:
             curr_player = playerX
         label["text"] = curr_player + "'s turn"
         
-        #check for win
+        # Check for win
         check_winner()
 def check_winner():
     global game_over, turns
@@ -59,17 +60,23 @@ def check_winner():
         
 
 def new_game():
-    global turns, game_over
+    global turns, game_over, curr_player
     turns = 0
     game_over = False
+    # Set the starting player to the last player who made a move
+    curr_player = playerO if last_player == playerX else playerX
     for row in range(3):
         for column in range(3):
-            board[row][column].config(text="", background=color_gray)
-    label.config(text=curr_player + "'s turn")
+            board[row][column].config(text="", background=color_gray, foreground=color_blue)
+    label.config(text=curr_player + "'s turn", foreground="white")  # Reset label color
+
+
 #game setup
 playerX = "X"
 playerO = "O"
 curr_player = playerX
+# Initialize the last player to the starting player
+last_player = playerX
 board = [[0,0,0],
          [0,0,0],
          [0,0,0]]
